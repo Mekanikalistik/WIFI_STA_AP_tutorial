@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32 WiFi Manager</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div class="container">
+        <h1>ESP32 WiFi Manager</h1>
+
+        <!-- WiFi Section -->
+        <div class="section">
+            <h2>WiFi Networks</h2>
+            <button id="scanBtn" class="btn btn-primary">Scan Networks</button>
+            <div id="networks" class="networks-list"></div>
+        </div>
+
+        <!-- LED Control Section -->
+        <div class="section">
+            <h2>LED Control</h2>
+            <div class="led-controls">
+                <button id="ledOnBtn" class="btn btn-success">Turn LED ON</button>
+                <button id="ledOffBtn" class="btn btn-danger">Turn LED OFF</button>
+                <div class="led-status">
+                    <span>LED Status: </span>
+                    <span id="ledStatus">Unknown</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Status Section -->
+        <div class="section">
+            <h2>Status</h2>
+            <div id="status" class="status-info">
+                Device ready. Click "Scan Networks" to find available WiFi networks.
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+
+</html>
