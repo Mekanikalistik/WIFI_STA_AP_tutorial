@@ -8,6 +8,13 @@ document.addEventListener('DOMContentLoaded', function () {
     const ledStatus = document.getElementById('ledStatus');
     const statusDiv = document.getElementById('status');
 
+    // New WiFi status elements
+    const connectionState = document.getElementById('connectionState');
+    const connectionMode = document.getElementById('connectionMode');
+    const retryCount = document.getElementById('retryCount');
+    const apStatus = document.getElementById('apStatus');
+    const retryBtn = document.getElementById('retryBtn');
+
     // Initialize status
     updateStatus('Device ready. Click "Scan Networks" to find available WiFi networks.');
 
@@ -40,6 +47,11 @@ document.addEventListener('DOMContentLoaded', function () {
 
     ledOffBtn.addEventListener('click', function () {
         controlLED(false);
+    });
+
+    // WiFi retry button
+    retryBtn.addEventListener('click', function () {
+        retrySTAConnection();
     });
 
     function controlLED(state) {
@@ -171,6 +183,91 @@ document.addEventListener('DOMContentLoaded', function () {
         console.log('Status:', message);
     }
 
+    function retrySTAConnection() {
+        retryBtn.disabled = true;
+        retryBtn.innerHTML = '<span class="loading"></span>Retrying...';
+        updateStatus('Manual STA retry initiated...');
+
+        fetch('/api/wifi/retry', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ action: 'retry' })
+        })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    updateStatus('Starting STA retry attempt...');
+                } else {
+                    updateStatus(data.message || 'Retry failed');
+                }
+            })
+            .catch(error => {
+                console.error('Retry error:', error);
+                updateStatus('Error retrying connection. Please try again.');
+            })
+            .finally(() => {
+                setTimeout(() => {
+                    retryBtn.disabled = false;
+                    retryBtn.innerHTML = 'Retry STA Connection';
+                }, 3000);
+            });
+    }
+
+    function updateWiFiStatusDisplay(data) {
+        // Update connection state
+        let stateText = '';
+        let stateClass = '';
+
+        switch (data.state) {
+            case 'connecting':
+                stateText = 'Connecting...';
+                stateClass = 'connecting';
+                break;
+            case 'connected':
+                stateText = 'Connected';
+                stateClass = 'connected';
+                break;
+            case 'failed_ap_active':
+                stateText = 'Failed - AP Active';
+                stateClass = 'failed';
+                break;
+            case 'ap_active':
+                stateText = 'AP Mode';
+                stateClass = 'failed';
+                break;
+            default:
+                stateText = data.state || 'Unknown';
+                stateClass = '';
+        }
+
+        connectionState.textContent = stateText;
+        connectionState.className = 'status-value ' + stateClass;
+
+        // Update connection mode
+        connectionMode.textContent = 'STA First, AP on Failure';
+
+        // Update retry count
+        retryCount.textContent = `${data.retry_count || 0}/3`;
+
+        // Update AP status
+        if (data.ap_enabled) {
+            apStatus.textContent = 'Enabled';
+            apStatus.className = 'status-value enabled';
+        } else {
+            apStatus.textContent = 'Disabled';
+            apStatus.className = 'status-value disabled';
+        }
+
+        // Show/hide retry button based on state
+        if (data.state === 'failed_ap_active' || data.state === 'ap_active') {
+            retryBtn.style.display = 'inline-block';
+        } else {
+            retryBtn.style.display = 'none';
+        }
+    }
+
     // Auto-refresh LED status and WiFi status every 5 seconds
     setInterval(() => {
         fetch('/api/led/status')
@@ -187,10 +284,20 @@ document.addEventListener('DOMContentLoaded', function () {
         fetch('/api/wifi/status')
             .then(response => response.json())
             .then(data => {
+                // Update WiFi status display
+                updateWiFiStatusDisplay(data);
+
+                // Update main status message
                 if (data.connected) {
                     updateStatus(`Connected to ${data.ssid} (RSSI: ${data.rssi}dBm, Channel: ${data.channel})`);
                 } else {
-                    updateStatus('Not connected to any WiFi network');
+                    if (data.state === 'connecting') {
+                        updateStatus('Attempting to connect to WiFi...');
+                    } else if (data.state === 'failed_ap_active') {
+                        updateStatus(`All STA attempts failed (${data.retry_count}/3). AP is now active for configuration.`);
+                    } else {
+                        updateStatus('Not connected to any WiFi network');
+                    }
                 }
             })
             .catch(error => {

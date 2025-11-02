@@ -18,6 +18,7 @@
 #include "driver/gpio.h"
 #include "esp_spiffs.h"
 #include <dirent.h>
+#include <dirent.h>
 
 /* The examples use WiFi configuration that you can set via project configuration menu.
 
@@ -39,6 +40,19 @@
 /* GPIO Configuration */
 #define LED_GPIO_PIN GPIO_NUM_35
 
+/* WiFi State Machine - STA-First, AP-on-Failure */
+typedef enum
+{
+    WIFI_STATE_STA_ATTEMPTING,       // STA is trying to connect
+    WIFI_STATE_STA_CONNECTED,        // STA successfully connected
+    WIFI_STATE_STA_FAILED_AP_ACTIVE, // All STA attempts failed, AP is active
+    WIFI_STATE_AP_ACTIVE             // AP is currently active (for other reasons)
+} wifi_state_t;
+
+/* Retry Configuration */
+#define STA_MAX_RETRY_ATTEMPTS 3 // Maximum STA retry attempts before enabling AP
+#define STA_RETRY_DELAY_MS 5000  // Delay between retries (5 seconds)
+
 /* The event group allows multiple bits for each event, but we only care about two events:
  * - we are connected to the AP with an IP
  * - we failed to connect after the maximum amount of retries */
@@ -49,7 +63,12 @@ static const char *TAG_AP = "WiFi SoftAP";
 static const char *TAG_STA = "WiFi Sta";
 static const char *TAG_HTTP = "HTTP Server";
 
-static int s_retry_num = 0;
+/* WiFi State Management */
+static wifi_state_t current_wifi_state = WIFI_STATE_STA_ATTEMPTING;
+static int sta_retry_count = 0;
+static bool ap_enabled = false;
+static esp_netif_t *sta_netif = NULL;
+static esp_netif_t *ap_netif = NULL;
 
 /* FreeRTOS event group to signal when we are connected/disconnected */
 static EventGroupHandle_t s_wifi_event_group;
@@ -65,93 +84,264 @@ static uint16_t scan_number = 0;
 /* LED state */
 static bool led_state = false;
 
+/* Forward declarations */
+static void handle_sta_failure(void);
+static void enable_ap_broadcasting(void);
+static void disable_ap_broadcasting(void);
+static bool load_sta_config(wifi_config_t *wifi_config);
+static void save_sta_config_to_nvs(const char *ssid, const char *password);
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED)
+    if (event_base == WIFI_EVENT)
     {
-        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
-        ESP_LOGI(TAG_AP, "Station " MACSTR " joined, AID=%d",
-                 MAC2STR(event->mac), event->aid);
-    }
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED)
-    {
-        wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
-        ESP_LOGI(TAG_AP, "Station " MACSTR " left, AID=%d, reason:%d",
-                 MAC2STR(event->mac), event->aid, event->reason);
-    }
-    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
-    {
-        esp_wifi_connect();
-        ESP_LOGI(TAG_STA, "Station started");
+        switch (event_id)
+        {
+        case WIFI_EVENT_AP_STACONNECTED:
+        {
+            wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
+            ESP_LOGI(TAG_AP, "Station " MACSTR " joined, AID=%d",
+                     MAC2STR(event->mac), event->aid);
+            break;
+        }
+        case WIFI_EVENT_AP_STADISCONNECTED:
+        {
+            wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
+            ESP_LOGI(TAG_AP, "Station " MACSTR " left, AID=%d, reason:%d",
+                     MAC2STR(event->mac), event->aid, event->reason);
+            break;
+        }
+        case WIFI_EVENT_STA_START:
+        {
+            ESP_LOGI(TAG_STA, "Station started");
+            // Start connection attempt in station mode
+            esp_wifi_connect();
+            break;
+        }
+        case WIFI_EVENT_STA_DISCONNECTED:
+        {
+            wifi_event_sta_disconnected_t *event = (wifi_event_sta_disconnected_t *)event_data;
+            ESP_LOGI(TAG_STA, "STA disconnected, reason: %d", event->reason);
+
+            if (current_wifi_state == WIFI_STATE_STA_CONNECTED)
+            {
+                // STA was connected but got disconnected, try to reconnect
+                ESP_LOGI(TAG_STA, "Attempting to reconnect STA...");
+                current_wifi_state = WIFI_STATE_STA_ATTEMPTING;
+                xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+                // Add delay before reconnecting
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                esp_wifi_connect();
+            }
+            else if (current_wifi_state == WIFI_STATE_STA_ATTEMPTING)
+            {
+                // STA attempt failed, handle failure with retry logic
+                ESP_LOGI(TAG_STA, "STA connection attempt failed, handling failure...");
+                handle_sta_failure();
+            }
+            break;
+        }
+        default:
+            break;
+        }
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
     {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG_STA, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
+        ESP_LOGI(TAG_HTTP, "STA CONNECTION SUCCESSFUL!");
+        ESP_LOGI(TAG_HTTP, "WebUI accessible at: http://" IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG_HTTP, "Also accessible as: http://iotlogger.local (if hostname resolution works)");
+
+        /* If we're in AP mode and STA connects, switch back to STA-only */
+        if (ap_enabled)
+        {
+            ESP_LOGI(TAG_STA, "STA connected while AP was active - switching to STA-only mode...");
+            disable_ap_broadcasting();
+        }
+
+        sta_retry_count = 0;
+        current_wifi_state = WIFI_STATE_STA_CONNECTED;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
-
-/* Initialize soft AP */
-esp_netif_t *wifi_init_softap(void)
+/* Enable AP broadcasting */
+static void enable_ap_broadcasting(void)
 {
-    esp_netif_t *esp_netif_ap = esp_netif_create_default_wifi_ap();
-
-    wifi_config_t wifi_ap_config = {
-        .ap = {
-            .ssid = EXAMPLE_ESP_WIFI_AP_SSID,
-            .ssid_len = strlen(EXAMPLE_ESP_WIFI_AP_SSID),
-            .channel = EXAMPLE_ESP_WIFI_CHANNEL,
-            .password = EXAMPLE_ESP_WIFI_AP_PASSWD,
-            .max_connection = EXAMPLE_MAX_STA_CONN,
-            .authmode = WIFI_AUTH_WPA2_PSK,
-            .pmf_cfg = {
-                .required = false,
-            },
-        },
-    };
-
-    if (strlen(EXAMPLE_ESP_WIFI_AP_PASSWD) == 0)
+    if (!ap_enabled)
     {
-        wifi_ap_config.ap.authmode = WIFI_AUTH_OPEN;
+        ESP_LOGI(TAG_AP, "Enabling AP broadcasting...");
+
+        /* Create AP netif if it doesn't exist */
+        if (ap_netif == NULL)
+        {
+            ap_netif = esp_netif_create_default_wifi_ap();
+        }
+
+        ap_enabled = true;
+        current_wifi_state = WIFI_STATE_STA_FAILED_AP_ACTIVE;
+
+        /* Configure AP mode */
+        wifi_config_t wifi_ap_config = {
+            .ap = {
+                .ssid = EXAMPLE_ESP_WIFI_AP_SSID,
+                .ssid_len = strlen(EXAMPLE_ESP_WIFI_AP_SSID),
+                .channel = EXAMPLE_ESP_WIFI_CHANNEL,
+                .password = EXAMPLE_ESP_WIFI_AP_PASSWD,
+                .max_connection = EXAMPLE_MAX_STA_CONN,
+                .authmode = WIFI_AUTH_WPA2_PSK,
+                .pmf_cfg = {
+                    .required = false,
+                },
+            },
+        };
+
+        if (strlen(EXAMPLE_ESP_WIFI_AP_PASSWD) == 0)
+        {
+            wifi_ap_config.ap.authmode = WIFI_AUTH_OPEN;
+        }
+
+        /* Set WiFi mode to APSTA to enable AP */
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_ap_config));
+
+        ESP_LOGI(TAG_AP, "AP broadcasting enabled successfully");
     }
-
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_ap_config));
-
-    ESP_LOGI(TAG_AP, "wifi_init_softap finished. SSID:%s password:%s channel:%d",
-             EXAMPLE_ESP_WIFI_AP_SSID, EXAMPLE_ESP_WIFI_AP_PASSWD, EXAMPLE_ESP_WIFI_CHANNEL);
-
-    return esp_netif_ap;
 }
 
-/* Initialize wifi station */
-esp_netif_t *wifi_init_sta(void)
+/* Check if STA configuration exists in NVS and load it */
+static bool load_sta_config(wifi_config_t *wifi_config)
 {
-    esp_netif_t *esp_netif_sta = esp_netif_create_default_wifi_sta();
+    nvs_handle_t nvs_handle;
+    esp_err_t ret = nvs_open("WiFi", NVS_READONLY, &nvs_handle);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGI(TAG_STA, "No WiFi configuration found");
+        return false;
+    }
 
-    wifi_config_t wifi_sta_config = {
-        .sta = {
-            .ssid = EXAMPLE_ESP_WIFI_STA_SSID,
-            .password = EXAMPLE_ESP_WIFI_STA_PASSWD,
-            .scan_method = WIFI_ALL_CHANNEL_SCAN,
-            .failure_retry_cnt = EXAMPLE_ESP_MAXIMUM_RETRY,
-            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (password len => 8).
-             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
-             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
-             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
-             */
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-            .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
-        },
+    char ssid[32] = {0};
+    char password[64] = {0};
+    size_t ssid_len = sizeof(ssid);
+    size_t password_len = sizeof(password);
+
+    ret = nvs_get_str(nvs_handle, "ssid", ssid, &ssid_len);
+    if (ret != ESP_OK)
+    {
+        nvs_close(nvs_handle);
+        ESP_LOGI(TAG_STA, "No SSID found in NVS");
+        return false;
+    }
+
+    nvs_get_str(nvs_handle, "password", password, &password_len);
+    nvs_close(nvs_handle);
+
+    /* Configure STA with loaded credentials */
+    memset(wifi_config, 0, sizeof(wifi_config_t));
+    wifi_config->sta = (wifi_sta_config_t){
+        .ssid = "",
+        .password = "",
+        .scan_method = WIFI_ALL_CHANNEL_SCAN,
+        .failure_retry_cnt = EXAMPLE_ESP_MAXIMUM_RETRY,
+        .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
     };
 
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config));
+    strncpy((char *)wifi_config->sta.ssid, ssid, sizeof(wifi_config->sta.ssid) - 1);
+    strncpy((char *)wifi_config->sta.password, password, sizeof(wifi_config->sta.password) - 1);
 
-    ESP_LOGI(TAG_STA, "wifi_init_sta finished.");
+    ESP_LOGI(TAG_STA, "Loaded STA configuration for SSID: %s", ssid);
+    return true;
+}
 
-    return esp_netif_sta;
+/* Save STA configuration to NVS */
+static void save_sta_config_to_nvs(const char *ssid, const char *password)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t ret = nvs_open("WiFi", NVS_READWRITE, &nvs_handle);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG_STA, "Failed to open NVS for writing: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = nvs_set_str(nvs_handle, "ssid", ssid);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG_STA, "Failed to save SSID: %s", esp_err_to_name(ret));
+    }
+
+    ret = nvs_set_str(nvs_handle, "password", password);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG_STA, "Failed to save password: %s", esp_err_to_name(ret));
+    }
+
+    ret = nvs_commit(nvs_handle);
+    if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG_STA, "Failed to commit NVS changes: %s", esp_err_to_name(ret));
+    }
+
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG_STA, "STA configuration saved to NVS");
+}
+
+/* Disable AP broadcasting and return to STA-only mode */
+static void disable_ap_broadcasting(void)
+{
+    if (ap_enabled)
+    {
+        ESP_LOGI(TAG_AP, "Disabling AP broadcasting, switching to STA-only mode...");
+
+        ap_enabled = false;
+
+        /* Switch back to STA-only mode */
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+        /* Destroy AP netif if it exists */
+        if (ap_netif != NULL)
+        {
+            esp_netif_destroy(ap_netif);
+            ap_netif = NULL;
+        }
+
+        ESP_LOGI(TAG_AP, "AP broadcasting disabled successfully, now in STA-only mode");
+    }
+}
+
+static void handle_sta_failure(void)
+{
+    sta_retry_count++;
+
+    if (sta_retry_count < STA_MAX_RETRY_ATTEMPTS)
+    {
+        ESP_LOGI(TAG_STA, "STA connection failed (attempt %d/%d), retrying in %d ms...",
+                 sta_retry_count, STA_MAX_RETRY_ATTEMPTS, STA_RETRY_DELAY_MS);
+
+        // Reset event bits for retry
+        xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
+
+        // Wait before retry
+        vTaskDelay(pdMS_TO_TICKS(STA_RETRY_DELAY_MS));
+
+        // Start next attempt
+        ESP_LOGI(TAG_STA, "Retrying STA connection...");
+        esp_wifi_connect();
+    }
+    else
+    {
+        ESP_LOGI(TAG_STA, "All STA connection attempts failed (%d/%d). Enabling AP broadcasting.",
+                 sta_retry_count, STA_MAX_RETRY_ATTEMPTS);
+
+        // All attempts failed, enable AP broadcasting
+        enable_ap_broadcasting();
+
+        // Set failure bit
+        xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+    }
 }
 
 /* Initialize GPIO for LED */
@@ -650,29 +840,49 @@ static esp_err_t wifi_config_post_handler(httpd_req_t *req)
             }
         }
 
-        // Configure STA with new credentials
-        wifi_config_t wifi_sta_config = {
-            .sta = {
-                .ssid = "",
-                .password = "",
-                .scan_method = WIFI_ALL_CHANNEL_SCAN,
-                .failure_retry_cnt = EXAMPLE_ESP_MAXIMUM_RETRY,
-                .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-                .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
-            },
-        };
+        ESP_LOGI(TAG_STA, "WiFi configuration received - SSID: %s", ssid);
 
-        strncpy((char *)wifi_sta_config.sta.ssid, ssid, sizeof(wifi_sta_config.sta.ssid) - 1);
-        strncpy((char *)wifi_sta_config.sta.password, password, sizeof(wifi_sta_config.sta.password) - 1);
+        // Save configuration to NVS
+        save_sta_config_to_nvs(ssid, password);
 
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config));
-        ESP_ERROR_CHECK(esp_wifi_connect());
+        // Reset state and attempt connection
+        sta_retry_count = 0;
+        current_wifi_state = WIFI_STATE_STA_ATTEMPTING;
 
-        ESP_LOGI(TAG_HTTP, "WiFi STA configured - SSID: %s", ssid);
+        // Disable AP if currently enabled
+        if (ap_enabled)
+        {
+            ESP_LOGI(TAG_STA, "Disconnecting AP clients and switching to STA-only mode...");
+            disable_ap_broadcasting();
+        }
 
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"Connecting to WiFi...\"}");
-        return ESP_OK;
+        // Load config and attempt connection
+        wifi_config_t wifi_config;
+        if (load_sta_config(&wifi_config))
+        {
+            ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+            ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+            ESP_ERROR_CHECK(esp_wifi_connect());
+
+            ESP_LOGI(TAG_STA, "WiFi configuration saved and connection attempt started");
+            ESP_LOGI(TAG_HTTP, "IMPORTANT: Device will now switch to STA mode and connect to: %s", ssid);
+            ESP_LOGI(TAG_HTTP, "After connection, access via: http://iotlogger.local");
+            ESP_LOGI(TAG_HTTP, "If .local doesn't work, device IP will be shown in serial output");
+
+            char response_msg[500];
+            snprintf(response_msg, sizeof(response_msg),
+                     "{\"success\":true,\"message\":\"✅ WiFi configured successfully!\\n\\n🔄 Device is switching to STA mode...\\n📶 Connecting to: %s\\n\\n🌐 After connection, access via:\\n• http://iotlogger.local\\n• Or check serial output for IP address\\n\\n⚠️ Disconnect from ESP32_AP network and connect to your WiFi network!\"}",
+                     ssid);
+
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, response_msg);
+            return ESP_OK;
+        }
+        else
+        {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to load configuration");
+            return ESP_FAIL;
+        }
     }
 
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid WiFi configuration");
@@ -696,21 +906,103 @@ static esp_err_t wifi_status_get_handler(httpd_req_t *req)
     wifi_ap_record_t ap_info;
     esp_err_t ret = esp_wifi_sta_get_ap_info(&ap_info);
 
-    char response[200];
+    char response[300];
+    const char *state_str;
+
+    switch (current_wifi_state)
+    {
+    case WIFI_STATE_STA_ATTEMPTING:
+        state_str = "connecting";
+        break;
+    case WIFI_STATE_STA_CONNECTED:
+        state_str = "connected";
+        break;
+    case WIFI_STATE_STA_FAILED_AP_ACTIVE:
+        state_str = "failed_ap_active";
+        break;
+    case WIFI_STATE_AP_ACTIVE:
+        state_str = "ap_active";
+        break;
+    default:
+        state_str = "unknown";
+        break;
+    }
+
     if (ret == ESP_OK)
     {
         snprintf(response, sizeof(response),
-                 "{\"connected\":true,\"ssid\":\"%s\",\"rssi\":%d,\"channel\":%d}",
-                 ap_info.ssid, ap_info.rssi, ap_info.primary);
+                 "{\"connected\":true,\"ssid\":\"%s\",\"rssi\":%d,\"channel\":%d,\"state\":\"%s\",\"retry_count\":%d,\"ap_enabled\":%s}",
+                 ap_info.ssid, ap_info.rssi, ap_info.primary, state_str, sta_retry_count, ap_enabled ? "true" : "false");
     }
     else
     {
-        snprintf(response, sizeof(response), "{\"connected\":false,\"error\":\"Not connected\"}");
+        snprintf(response, sizeof(response),
+                 "{\"connected\":false,\"state\":\"%s\",\"retry_count\":%d,\"ap_enabled\":%s,\"error\":\"%s\"}",
+                 state_str, sta_retry_count, ap_enabled ? "true" : "false",
+                 current_wifi_state == WIFI_STATE_STA_FAILED_AP_ACTIVE ? "All STA attempts failed" : "Not connected");
     }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, response);
     return ESP_OK;
+}
+
+/* HTTP POST handler for manual STA retry */
+static esp_err_t wifi_retry_post_handler(httpd_req_t *req)
+{
+    char buf[50];
+    int ret, remaining = req->content_len;
+
+    if (remaining >= sizeof(buf))
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Content too long");
+        return ESP_FAIL;
+    }
+
+    ret = httpd_req_recv(req, buf, remaining);
+    if (ret <= 0)
+    {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to receive data");
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+
+    // Parse JSON for retry action
+    if (strstr(buf, "\"action\":\"retry\""))
+    {
+        ESP_LOGI(TAG_STA, "Manual STA retry requested via API");
+
+        /* Reset retry count and state for new attempt */
+        sta_retry_count = 0;
+        current_wifi_state = WIFI_STATE_STA_ATTEMPTING;
+
+        /* Disable AP broadcasting for new STA connection attempt */
+        disable_ap_broadcasting();
+
+        if (current_wifi_state != WIFI_STATE_STA_CONNECTED)
+        {
+            ESP_LOGI(TAG_STA, "Starting manual STA connection retry...");
+
+            /* Ensure we're in STA-only mode */
+            ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+            esp_wifi_connect();
+
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"Starting STA connection retry...\"}");
+            return ESP_OK;
+        }
+        else
+        {
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Already connected to STA\"}");
+            return ESP_OK;
+        }
+    }
+    else
+    {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid action");
+        return ESP_FAIL;
+    }
 }
 
 /* Start HTTP server */
@@ -794,6 +1086,13 @@ static httpd_handle_t start_webserver(void)
         .user_ctx = NULL};
     httpd_register_uri_handler(server, &wifi_status);
 
+    httpd_uri_t wifi_retry = {
+        .uri = "/api/wifi/retry",
+        .method = HTTP_POST,
+        .handler = wifi_retry_post_handler,
+        .user_ctx = NULL};
+    httpd_register_uri_handler(server, &wifi_retry);
+
     /* URI handler for getting uploaded files - register wildcard handler last */
     httpd_uri_t file_download = {
         .uri = "/*", // Match all URIs of type /path/to/file
@@ -809,10 +1108,11 @@ static httpd_handle_t start_webserver(void)
 
 void app_main(void)
 {
+    /* Initialize TCP/IP stack */
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // Initialize NVS
+    /* Initialize NVS */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
@@ -824,69 +1124,95 @@ void app_main(void)
     /* Initialize event group */
     s_wifi_event_group = xEventGroupCreate();
 
-    /* Register Event handler */
+    /* Register Event handlers */
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
                                                         &wifi_event_handler,
                                                         NULL,
                                                         NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
+                                                        ESP_EVENT_ANY_ID,
                                                         &wifi_event_handler,
                                                         NULL,
                                                         NULL));
 
-    /*Initialize WiFi */
+    /* Initialize WiFi */
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    /* Create STA interface */
+    sta_netif = esp_netif_create_default_wifi_sta();
 
-    /* Initialize AP */
-    ESP_LOGI(TAG_AP, "ESP_WIFI_MODE_AP");
-    esp_netif_t *esp_netif_ap = wifi_init_softap();
+    /* Set hostname for network discovery - ESP-IDF standard approach */
+    ESP_ERROR_CHECK(esp_netif_set_hostname(sta_netif, "iotlogger"));
+    ESP_LOGI(TAG_HTTP, "Hostname set to: iotlogger (accessible as iotlogger.local)");
 
-    /* Initialize STA */
-    ESP_LOGI(TAG_STA, "ESP_WIFI_MODE_STA");
-    esp_netif_t *wifi_init_sta_result = wifi_init_sta();
+    /* Try to load existing STA configuration */
+    wifi_config_t wifi_config;
+    bool sta_config_exists = load_sta_config(&wifi_config);
 
-    /* Start WiFi */
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    /* Start HTTP server immediately - don't wait for STA connection */
-    ESP_LOGI(TAG_HTTP, "Starting HTTP server in AP mode...");
-
-    /* Enable napt on the AP netif for internet access through STA if connected */
-    if (esp_netif_napt_enable(esp_netif_ap) != ESP_OK)
+    if (sta_config_exists)
     {
-        ESP_LOGE(TAG_STA, "NAPT not enabled on the netif: %p", esp_netif_ap);
-    }
-
-    /*
-     * Try to connect STA in background - don't block on it
-     */
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-                                           WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                           pdFALSE,
-                                           pdFALSE,
-                                           pdMS_TO_TICKS(10000)); // Wait 10 seconds max
-
-    /* Check STA connection status */
-    if (bits & WIFI_CONNECTED_BIT)
-    {
-        ESP_LOGI(TAG_STA, "connected to ap SSID:%s password:%s",
-                 EXAMPLE_ESP_WIFI_STA_SSID, EXAMPLE_ESP_WIFI_STA_PASSWD);
-        /* Set sta as the default interface when connected */
-        esp_netif_set_default_netif(wifi_init_sta_result);
-    }
-    else if (bits & WIFI_FAIL_BIT)
-    {
-        ESP_LOGI(TAG_STA, "Failed to connect to SSID:%s, password:%s",
-                 EXAMPLE_ESP_WIFI_STA_SSID, EXAMPLE_ESP_WIFI_STA_PASSWD);
+        /* Start in STA mode with existing configuration */
+        ESP_LOGI(TAG_STA, "Found existing WiFi configuration - starting in STA mode");
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+        ESP_ERROR_CHECK(esp_wifi_start());
+        current_wifi_state = WIFI_STATE_STA_ATTEMPTING;
     }
     else
     {
-        ESP_LOGI(TAG_STA, "STA connection attempt timed out - continuing in AP-only mode");
+        /* No configuration found - start in AP+STA mode for provisioning */
+        ESP_LOGI(TAG_STA, "No WiFi configuration found - starting in AP+STA mode for provisioning");
+        ESP_LOGI(TAG_STA, "AP broadcasts for WebUI access, STA can scan for available networks");
+
+        /* Create both STA and AP interfaces */
+        ap_netif = esp_netif_create_default_wifi_ap();
+        ESP_ERROR_CHECK(esp_netif_set_hostname(ap_netif, "iotlogger"));
+
+        /* Configure AP mode */
+        wifi_config_t wifi_ap_config = {
+            .ap = {
+                .ssid = EXAMPLE_ESP_WIFI_AP_SSID,
+                .ssid_len = strlen(EXAMPLE_ESP_WIFI_AP_SSID),
+                .channel = EXAMPLE_ESP_WIFI_CHANNEL,
+                .password = EXAMPLE_ESP_WIFI_AP_PASSWD,
+                .max_connection = EXAMPLE_MAX_STA_CONN,
+                .authmode = WIFI_AUTH_WPA2_PSK,
+                .pmf_cfg = {
+                    .required = false,
+                },
+            },
+        };
+
+        if (strlen(EXAMPLE_ESP_WIFI_AP_PASSWD) == 0)
+        {
+            wifi_ap_config.ap.authmode = WIFI_AUTH_OPEN;
+        }
+
+        /* Configure STA mode with default settings for scanning */
+        wifi_config_t wifi_sta_config = {
+            .sta = {
+                .ssid = "",
+                .password = "",
+                .scan_method = WIFI_ALL_CHANNEL_SCAN,
+                .failure_retry_cnt = 0, // No auto-retry in provisioning mode
+                .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+                .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
+            },
+        };
+
+        /* Start in AP+STA mode - AP for WebUI, STA for scanning */
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_ap_config));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config));
+        ESP_ERROR_CHECK(esp_wifi_start());
+
+        current_wifi_state = WIFI_STATE_AP_ACTIVE;
+        ap_enabled = true;
+
+        ESP_LOGI(TAG_HTTP, "AP is broadcasting: %s (IP: http://192.168.4.1)", EXAMPLE_ESP_WIFI_AP_SSID);
+        ESP_LOGI(TAG_HTTP, "WebUI can now scan for available WiFi networks!");
     }
 
     /* Initialize GPIO for LED */
@@ -898,9 +1224,15 @@ void app_main(void)
     /* Start HTTP server */
     server = start_webserver();
 
-    ESP_LOGI(TAG_HTTP, "ESP32 SoftAP+STA with Web UI started!");
-    ESP_LOGI(TAG_HTTP, "Connect to WiFi AP: %s", EXAMPLE_ESP_WIFI_AP_SSID);
-    ESP_LOGI(TAG_HTTP, "Open browser to: http://192.168.4.1");
+    ESP_LOGI(TAG_HTTP, "ESP32 WiFi System started!");
+    if (sta_config_exists)
+    {
+        ESP_LOGI(TAG_HTTP, "Mode: STA - attempting to connect to saved network");
+    }
+    else
+    {
+        ESP_LOGI(TAG_HTTP, "Mode: AP Provisioning - configure WiFi via WebUI at http://192.168.4.1");
+    }
 
     while (1)
     {
